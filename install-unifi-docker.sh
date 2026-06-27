@@ -49,7 +49,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-SCRIPT_VERSION="1.4.2"
+SCRIPT_VERSION="1.4.3"
 
 # ----------------------------------------------------------------------------
 # Defaults (overridable via flags)
@@ -246,6 +246,8 @@ check_host_environment() {
   if [[ -f /.dockerenv ]]; then
     abort_data_loss "This script is running inside a Docker container. Run it on the host OS with Docker installed, not inside a container."
   fi
+
+  detect_snap_docker
 
   if grep -sq '/docker/' /proc/1/cgroup 2>/dev/null && [[ ! -S /var/run/docker.sock ]] && ! sudo test -S /var/run/docker.sock 2>/dev/null; then
     abort_data_loss "Docker cgroup detected but /var/run/docker.sock is unavailable. Install Docker on the host or bind-mount the socket."
@@ -574,6 +576,60 @@ docker_compose() {
 
 docker_compose_quiet() {
   (cd "${INSTALL_DIR}" && sudo docker compose "$@" 2>/dev/null)
+}
+
+detect_snap_docker() {
+  local docker_bin docker_real
+  docker_bin="$(command -v docker 2>/dev/null || true)"
+  [[ -n "${docker_bin}" ]] || return 0
+  docker_real="$(readlink -f "${docker_bin}" 2>/dev/null || echo "${docker_bin}")"
+  if [[ "${docker_real}" == *"/snap/"* ]] || [[ "${docker_bin}" == /snap/* ]]; then
+    err "Snap-packaged Docker detected (${docker_bin})."
+    err "Snap Docker often breaks MongoDB volume mounts and healthchecks on ARM boards."
+    err "Switch to apt Docker, then re-run this script:"
+    err "  sudo snap remove docker --purge"
+    err "  sudo apt-get update && sudo apt-get install -y docker.io docker-compose-v2"
+    err "  sudo systemctl enable --now docker"
+    abort_data_loss "Install apt-based Docker (docker.io) before continuing."
+  fi
+}
+
+show_container_logs() {
+  local service="$1" lines="${2:-80}"
+  err "--- Last ${lines} lines of ${service} logs ---"
+  docker_compose logs --no-color --tail "${lines}" "${service}" 2>&1 | while IFS= read -r line; do err "  ${line}"; done || true
+  err "--- end ${service} logs ---"
+}
+
+diagnose_mongo_startup_failure() {
+  err "MongoDB container failed to become ready."
+  show_container_logs "unifi-db" 100
+  if [[ -d "${INSTALL_DIR}/mongo-data" ]]; then
+    detail "mongo-data size: $(du -sh "${INSTALL_DIR}/mongo-data" 2>/dev/null | awk '{print $1}')"
+  fi
+  err "If this is a retry after a failed install, reset Mongo data and re-run:"
+  err "  cd ${INSTALL_DIR} && sudo docker compose down"
+  err "  sudo rm -rf ${INSTALL_DIR}/mongo-data/*"
+  err "  bash ~/install-unifi-docker.sh --migrate-from-deb -y"
+}
+
+start_compose_stack() {
+  info "Starting MongoDB container (unifi-db)..."
+  if ! docker_compose up -d unifi-db; then
+    diagnose_mongo_startup_failure
+    abort_data_loss "Failed to start unifi-db container."
+  fi
+
+  if ! wait_for_mongo_healthy; then
+    diagnose_mongo_startup_failure
+    abort_data_loss "MongoDB did not become ready."
+  fi
+
+  info "Starting UniFi container (unifi)..."
+  if ! docker_compose up -d unifi; then
+    show_container_logs "unifi" 80
+    abort_data_loss "Failed to start unifi container."
+  fi
 }
 
 install_docker() {
@@ -1175,11 +1231,11 @@ services:
       - ./mongo-data:/data/db
       - ./init-mongo.sh:/docker-entrypoint-initdb.d/init-mongo.sh:ro
     healthcheck:
-      test: ["CMD-SHELL", "mongosh --quiet -u \"$$MONGO_INITDB_ROOT_USERNAME\" -p \"$$MONGO_INITDB_ROOT_PASSWORD\" --authenticationDatabase admin --eval 'db.adminCommand(\"ping\").ok' || exit 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 12
-      start_period: 30s
+      test: ["CMD-SHELL", "mongosh \"mongodb://$$MONGO_INITDB_ROOT_USERNAME:$$MONGO_INITDB_ROOT_PASSWORD@127.0.0.1:27017/admin?authSource=admin\" --eval 'db.adminCommand(\"ping\").ok' --quiet || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 30
+      start_period: 120s
     restart: unless-stopped
 
   unifi:
@@ -1187,7 +1243,7 @@ services:
     container_name: unifi
 ${network_block_unifi}    depends_on:
       unifi-db:
-        condition: service_healthy
+        condition: service_started
     environment:
       - PUID=\${PUID}
       - PGID=\${PGID}
@@ -1364,7 +1420,7 @@ verify_config_preserved() {
 wait_for_mongo_healthy() {
   info "Waiting for MongoDB to become healthy..."
   local i state
-  for i in $(seq 1 36); do
+  for i in $(seq 1 60); do
     state="$(docker_compose_quiet ps --format json unifi-db 2>/dev/null | grep -o '"Health":"[^"]*"' | head -1 | cut -d'"' -f4 || true)"
     if [[ "${state}" == "healthy" ]]; then
       ok "MongoDB is healthy."
@@ -1378,10 +1434,10 @@ wait_for_mongo_healthy() {
         return 0
       fi
     fi
-    detail "MongoDB not ready yet (attempt ${i}/36)..."
+    detail "MongoDB not ready yet (attempt ${i}/60)..."
     sleep 5
   done
-  abort_data_loss "MongoDB did not become healthy within 3 minutes."
+  return 1
 }
 
 ensure_native_unifi_stopped_for_migration() {
@@ -1465,10 +1521,8 @@ run_fresh_install() {
   info "Pulling container images..."
   docker_compose pull
 
-  info "Starting containers..."
-  docker_compose up -d
+  start_compose_stack
 
-  wait_for_mongo_healthy
   scan_mongo_logs_for_errors || warn "MongoDB log scan reported issues on fresh install — check: docker compose logs unifi-db"
   wait_for_unifi_web || true
 
@@ -1528,9 +1582,7 @@ run_upgrade() {
   docker_compose pull
 
   info "Starting upgraded containers..."
-  docker_compose up -d
-
-  wait_for_mongo_healthy
+  start_compose_stack
 
   if ! scan_mongo_logs_for_errors; then
     err "MongoDB storage/upgrade errors detected in container logs."
