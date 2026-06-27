@@ -44,6 +44,8 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
+SCRIPT_VERSION="1.2.0"
+
 # ----------------------------------------------------------------------------
 # Defaults (overridable via flags)
 # ----------------------------------------------------------------------------
@@ -149,7 +151,7 @@ trap 'restore_unattended_upgrades; release_script_lock' EXIT
 # Mirror all script output to a log file for troubleshooting.
 exec > >(tee -a "${LOG_FILE}") 2>&1
 
-info "UniFi Docker installer started. Logging to ${LOG_FILE}"
+info "UniFi Docker installer v${SCRIPT_VERSION} started. Logging to ${LOG_FILE}"
 
 # ----------------------------------------------------------------------------
 # Usage / argument parsing
@@ -290,12 +292,17 @@ check_dns_and_connectivity() {
   fi
 
   detail "Probing linuxserver registry (lscr.io/v2/) ..."
-  if ! url_is_reachable "https://lscr.io/v2/" "registry"; then
-    if command -v host >/dev/null 2>&1 && host lscr.io >/dev/null 2>&1; then
-      warn "lscr.io resolves in DNS but HTTPS probe failed. Continuing — docker pull may still work."
-      warn "If pull fails later, check firewall/proxy rules for lscr.io and registry traffic."
-    else
-      die "Could not reach https://lscr.io/v2/ and DNS lookup for lscr.io failed. Check DNS and firewall."
+  if url_is_reachable "https://lscr.io/v2/" "registry"; then
+    ok "linuxserver registry (lscr.io) appears reachable."
+  else
+    warn "Could not confirm HTTPS access to lscr.io/v2/ from this host."
+    warn "Continuing — docker compose pull is the definitive test for the UniFi image."
+    if command -v host >/dev/null 2>&1; then
+      if host lscr.io >/dev/null 2>&1; then
+        detail "DNS: lscr.io resolves ($(host lscr.io | head -1))"
+      else
+        warn "DNS lookup for lscr.io also failed. Ensure outbound HTTPS to lscr.io is allowed."
+      fi
     fi
   fi
 
