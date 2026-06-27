@@ -114,7 +114,7 @@ MongoDB credentials and image tags are stored in `~/unifi/.env` (mode `600` — 
 | `--backup-file PATH` | `.unf` backup for migration (optional) |
 | `--unifi-user USER` | Native controller admin user (or `UNIFI_CTRL_USER`) |
 | `--unifi-pass PASS` | Native controller password (or `UNIFI_CTRL_PASS`) |
-| `--disable-native-after` | Disable native `unifi.service` after migration |
+| `--keep-native-enabled` | Leave native `unifi.service` enabled after verified migration |
 | `-y`, `--yes` | Non-interactive; skip confirmation prompt |
 | `-h`, `--help` | Show built-in help |
 
@@ -194,7 +194,7 @@ curl -fsSL -o install-unifi-docker.sh \
   https://raw.githubusercontent.com/HammondAutomationHub/unifi-networkapplication/main/install-unifi-docker.sh
 chmod +x install-unifi-docker.sh
 
-./install-unifi-docker.sh --migrate-from-deb --disable-native-after -y
+./install-unifi-docker.sh --migrate-from-deb -y
 ```
 
 **Backup sources** (first match wins):
@@ -210,11 +210,11 @@ Prefer credentials for a fresh backup. Autobackup files older than 24 hours trig
 | Step | Automated |
 |------|-----------|
 | Create/find `.unf` backup | Yes |
-| Stop native `unifi.service` | Yes |
+| Stop native `unifi.service` | Yes (stays **enabled** for rollback if migration fails) |
 | Install Docker Compose stack | Yes |
 | Upload `.unf` to new controller | Yes (API) |
 | Set Inform Host + Override | Yes (requires credentials) |
-| Disable native service | Optional (`--disable-native-after`) |
+| Disable native service | Yes, **automatic** after restore + verification succeed |
 
 If API restore fails, the script leaves Docker running and prints the backup path for manual restore in the web UI.
 

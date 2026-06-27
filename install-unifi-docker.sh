@@ -21,7 +21,7 @@
 #       --backup-file PATH   Use this .unf backup (optional; auto-detected if omitted)
 #       --unifi-user USER    Native controller admin user (or env UNIFI_CTRL_USER)
 #       --unifi-pass PASS    Native controller admin password (or env UNIFI_CTRL_PASS)
-#       --disable-native-after  Disable native unifi.service after successful migration
+#       --keep-native-enabled  Do not disable native unifi.service after verified migration
 #   -y, --yes                Non-interactive: accept all defaults, no confirmation prompt
 #   -h, --help               Show this help text
 #
@@ -49,7 +49,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-SCRIPT_VERSION="1.4.3"
+SCRIPT_VERSION="1.4.4"
 
 # ----------------------------------------------------------------------------
 # Defaults (overridable via flags)
@@ -68,9 +68,10 @@ ASSUME_YES=0
 BACKUP_FILE=""
 UNIFI_CTRL_USER="${UNIFI_CTRL_USER:-}"
 UNIFI_CTRL_PASS="${UNIFI_CTRL_PASS:-}"
-DISABLE_NATIVE_AFTER=0
+KEEP_NATIVE_ENABLED=0
 MIGRATION_UNF=""
 MIGRATION_RESTORE_OK=0
+NATIVE_UNIFI_DISABLED=0
 UNIFI_API="https://127.0.0.1:8443"
 
 LOG_FILE="/tmp/unifi-install-$(date +%Y%m%d-%H%M%S).log"
@@ -185,7 +186,11 @@ while [[ $# -gt 0 ]]; do
     --backup-file) BACKUP_FILE="$2"; shift 2 ;;
     --unifi-user) UNIFI_CTRL_USER="$2"; shift 2 ;;
     --unifi-pass) UNIFI_CTRL_PASS="$2"; shift 2 ;;
-    --disable-native-after) DISABLE_NATIVE_AFTER=1; shift ;;
+    --disable-native-after)
+      warn "--disable-native-after is deprecated (disable is automatic after verified migration)."
+      shift
+      ;;
+    --keep-native-enabled) KEEP_NATIVE_ENABLED=1; shift ;;
     -f|--force)
       warn "--force is deprecated and ignored. The script auto-detects upgrade vs fresh install."
       warn "Use --fresh to force a new install on an empty directory only."
@@ -834,7 +839,7 @@ prepare_migration_backup() {
 }
 
 stop_native_unifi_service() {
-  info "Stopping native UniFi service..."
+  info "Stopping native UniFi service (remains enabled for rollback if migration fails)..."
   if systemctl is-active --quiet unifi 2>/dev/null; then
     if ! systemctl stop unifi; then
       abort_data_loss "Failed to stop native unifi service. Run: sudo systemctl stop unifi"
@@ -844,7 +849,67 @@ stop_native_unifi_service() {
   if systemctl is-active --quiet unifi 2>/dev/null; then
     abort_data_loss "Native unifi service is still active after stop request."
   fi
-  ok "Native unifi service stopped."
+  ok "Native unifi.service stopped (still enabled — restart with: sudo systemctl start unifi)."
+}
+
+verify_migration_success() {
+  local failures=0 cookie_jar
+
+  info "Verifying migrated Docker controller before disabling native .deb service..."
+  detail "Checking restore status, containers, web UI, and API login..."
+
+  if [[ "${MIGRATION_RESTORE_OK}" -ne 1 ]]; then
+    err "Restore was not confirmed successful."
+    failures=$((failures + 1))
+  fi
+
+  if ! docker_compose_quiet ps --status running --services 2>/dev/null | grep -qx 'unifi-db'; then
+    err "MongoDB container (unifi-db) is not running."
+    failures=$((failures + 1))
+  fi
+  if ! docker_compose_quiet ps --status running --services 2>/dev/null | grep -qx 'unifi'; then
+    err "UniFi container (unifi) is not running."
+    failures=$((failures + 1))
+  fi
+
+  if ! wait_for_unifi_web; then
+    err "Docker UniFi web UI is not responding on ${UNIFI_API}."
+    failures=$((failures + 1))
+  fi
+
+  if [[ -n "${UNIFI_CTRL_USER}" && -n "${UNIFI_CTRL_PASS}" ]]; then
+    cookie_jar="$(mktemp)"
+    if unifi_api_login "${UNIFI_API}" "${UNIFI_CTRL_USER}" "${UNIFI_CTRL_PASS}" "${cookie_jar}"; then
+      ok "Post-migration API login verified."
+    else
+      err "Could not log in to Docker controller with supplied credentials."
+      failures=$((failures + 1))
+    fi
+    rm -f "${cookie_jar}"
+  else
+    warn "No credentials supplied — skipping API login verification."
+  fi
+
+  if [[ "${failures}" -gt 0 ]]; then
+    err "Migration verification failed (${failures} check(s)). Native unifi.service will NOT be disabled."
+    err "Your native controller can be restarted with: sudo systemctl start unifi"
+    return 1
+  fi
+
+  ok "Migration verification passed."
+  return 0
+}
+
+disable_native_unifi_service() {
+  info "Disabling native unifi.service (package remains installed; data preserved in /usr/lib/unifi/)..."
+  if systemctl disable unifi 2>/dev/null; then
+    NATIVE_UNIFI_DISABLED=1
+    ok "Native unifi.service disabled. Fallback: sudo systemctl enable --now unifi"
+  else
+    warn "Could not disable native unifi.service automatically."
+    warn "Run manually after you confirm migration: sudo systemctl disable unifi"
+    return 1
+  fi
 }
 
 wait_for_unifi_api() {
@@ -957,14 +1022,21 @@ run_migration_post_install() {
     ok "Automated migration restore completed."
   else
     warn "Manual restore required in the web UI using: ${MIGRATION_UNF}"
+    warn "Native unifi.service was stopped but remains enabled: sudo systemctl start unifi"
     return 1
   fi
 
-  if [[ "${DISABLE_NATIVE_AFTER}" -eq 1 ]]; then
-    info "Disabling native unifi.service..."
-    systemctl disable unifi 2>/dev/null || true
-    ok "Native unifi.service disabled (Docker controller is now primary)."
+  if ! verify_migration_success; then
+    return 1
   fi
+
+  if [[ "${KEEP_NATIVE_ENABLED}" -eq 1 ]]; then
+    warn "Migration verified. Keeping native unifi.service enabled (--keep-native-enabled)."
+    warn "Stop it manually to avoid port conflicts: sudo systemctl stop unifi"
+    return 0
+  fi
+
+  disable_native_unifi_service
 }
 
 detect_installation() {
@@ -1640,7 +1712,13 @@ print_summary() {
     echo " Automated migration complete"
     echo " Backup used:   ${MIGRATION_UNF}"
     echo " Web UI:        https://${host_ip}:8443"
-    echo " Verify devices reconnect; adopt if Inform Host was set."
+    if [[ "${NATIVE_UNIFI_DISABLED}" -eq 1 ]]; then
+      echo " Native .deb:   unifi.service disabled (Docker is primary)"
+      echo " Fallback:      sudo systemctl enable --now unifi"
+    else
+      echo " Native .deb:   still enabled (not disabled — verification or --keep-native-enabled)"
+    fi
+    echo " Verify devices reconnect; confirm Inform Host if needed."
     echo "----------------------------------------------------------------"
   elif [[ "${mode}" == "fresh" && "${MIGRATE_FROM_DEB}" -eq 1 ]]; then
     echo "----------------------------------------------------------------"
@@ -1648,6 +1726,7 @@ print_summary() {
     echo "   Backup file: ${MIGRATION_UNF:-<see migration-backup/ >}"
     echo "   Web UI: https://${host_ip}:8443 -> Restore from backup"
     echo "   Set Inform Host to ${host_ip} with Override enabled"
+    echo "   Native unifi.service stays enabled until restore is verified"
     echo "----------------------------------------------------------------"
   elif [[ "${mode}" == "fresh" && "${LEGACY_REASON}" == "native_deb_migrate" ]]; then
     echo "----------------------------------------------------------------"
@@ -1656,7 +1735,8 @@ print_summary() {
     echo "   2. Choose Restore from backup and upload your .unf file"
     echo "   3. Settings -> System -> Advanced -> Inform Host = ${host_ip}"
     echo "      Enable Override Inform Host"
-    echo "   4. Optional after devices reconnect: sudo systemctl disable --now unifi"
+    echo "   4. After verified migration the script disables native unifi.service automatically"
+    echo "      (use --keep-native-enabled to leave it enabled)"
     echo "----------------------------------------------------------------"
   elif [[ "${mode}" == "fresh" ]]; then
     echo "----------------------------------------------------------------"
