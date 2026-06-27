@@ -49,7 +49,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-SCRIPT_VERSION="1.4.0"
+SCRIPT_VERSION="1.4.2"
 
 # ----------------------------------------------------------------------------
 # Defaults (overridable via flags)
@@ -387,7 +387,7 @@ check_system_resources() {
 }
 
 compute_memory_limits() {
-  local mem_mb="$1"
+  local mem_mb="${1:-}"
   if [[ -z "${mem_mb}" ]]; then
     mem_mb="$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo)"
   fi
@@ -1627,6 +1627,11 @@ detect_installation
 
 if [[ "${INSTALL_MODE}" == "blocked" ]]; then
   report_blocked_legacy
+  if [[ "${LEGACY_REASON}" == "native_deb" ]]; then
+    err "Native .deb UniFi is installed — this run did not include --migrate-from-deb."
+    err "Re-run with credentials, for example:"
+    err "  UNIFI_CTRL_USER=admin UNIFI_CTRL_PASS='your-password' ./install-unifi-docker.sh --migrate-from-deb -y"
+  fi
   abort_data_loss "Resolve the legacy state above, then re-run this script."
 fi
 
