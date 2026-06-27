@@ -30,6 +30,53 @@ Designed for **Ubuntu/Debian** hosts on **x86_64** and **arm64** (including boar
 
 The script checks for and uses: `bash`, `curl`, `sudo`, `awk`, `tar`, `realpath`, `flock`, `openssl`, and `docker compose`.
 
+## Getting the script (important)
+
+The file **must** be the raw Bash script. If you download GitHub’s **HTML web page** instead, Bash will fail with:
+
+```text
+syntax error near unexpected token `newline'
+<!DOCTYPE html>'
+```
+
+**Verify before running:**
+
+```bash
+head -1 install-unifi-docker.sh
+# Expected: #!/usr/bin/env bash
+
+file install-unifi-docker.sh
+# Expected: Bourne-Again shell script (not HTML)
+```
+
+### Recommended: git clone
+
+```bash
+git clone https://github.com/YOUR_USERNAME/unifi-networkapplication.git
+cd unifi-networkapplication
+chmod +x install-unifi-docker.sh
+```
+
+### Download raw file (curl)
+
+Use the **raw** URL, not the `github.com/.../blob/...` page:
+
+```bash
+curl -fsSL -o install-unifi-docker.sh \
+  https://raw.githubusercontent.com/YOUR_USERNAME/unifi-networkapplication/main/install-unifi-docker.sh
+chmod +x install-unifi-docker.sh
+head -1 install-unifi-docker.sh   # must print: #!/usr/bin/env bash
+```
+
+### Copy from your PC (SCP)
+
+From Windows/macOS/Linux where you already have the repo:
+
+```bash
+scp install-unifi-docker.sh root@<khadas-ip>:~/
+ssh root@<khadas-ip> 'chmod +x ~/install-unifi-docker.sh && head -1 ~/install-unifi-docker.sh'
+```
+
 ## Quick start
 
 ```bash
@@ -198,6 +245,15 @@ Per [linuxserver.io documentation](https://docs.linuxserver.io/images/docker-uni
 - Do not use `latest` for MongoDB in production; pin a version and upgrade one major at a time.
 
 ## Troubleshooting
+
+**`syntax error` / `<!DOCTYPE html>` on line 7**
+
+The file on disk is an HTML page, not the installer. Remove it and re-download using [Getting the script](#getting-the-script-important) above. Do **not** save the GitHub “blob” browser URL in a browser “Save as” dialog.
+
+```bash
+rm -f ./install-unifi-docker.sh
+# Then use git clone, raw curl, or scp — and verify: head -1 install-unifi-docker.sh
+```
 
 **Script says another instance is running**
 

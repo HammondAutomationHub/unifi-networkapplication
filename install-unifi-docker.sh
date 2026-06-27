@@ -243,22 +243,69 @@ check_host_environment() {
   ok "Host environment check passed."
 }
 
+# curl -f fails on registry 401/404 even when the host is reachable — use explicit codes.
+url_http_code() {
+  curl -sS -o /dev/null -w '%{http_code}' --max-time 15 "$1" 2>/dev/null || echo "000"
+}
+
+url_is_reachable() {
+  local url="$1"
+  local expect="${2:-any}"
+  local code
+  code="$(url_http_code "${url}")"
+  detail "HTTP ${code} from ${url}"
+
+  case "${code}" in
+    000)
+      return 1
+      ;;
+  esac
+
+  case "${expect}" in
+    registry)
+      # OCI/Docker registries often return 401 (auth required) or 404 on /v2/ — still reachable.
+      case "${code}" in
+        200|401|404) return 0 ;;
+        *) return 1 ;;
+      esac
+      ;;
+    web)
+      case "${code}" in
+        2*|3*) return 0 ;;
+        *) return 1 ;;
+      esac
+      ;;
+    any)
+      return 0
+      ;;
+  esac
+}
+
 check_dns_and_connectivity() {
-  local endpoints=(
-    "https://hub.docker.com"
-    "https://lscr.io"
-    "https://registry-1.docker.io/v2/"
-  )
-  local ep
   info "Checking network connectivity to Docker registries..."
-  for ep in "${endpoints[@]}"; do
-    detail "Probing ${ep} ..."
-    if ! curl -fsSL --max-time 10 "${ep}" >/dev/null 2>&1; then
-      die "Could not reach ${ep}. Check DNS, firewall, and proxy settings."
+
+  detail "Probing general HTTPS (hub.docker.com) ..."
+  if ! url_is_reachable "https://hub.docker.com" "web"; then
+    die "Could not reach https://hub.docker.com. Check DNS, firewall, and proxy settings."
+  fi
+
+  detail "Probing linuxserver registry (lscr.io/v2/) ..."
+  if ! url_is_reachable "https://lscr.io/v2/" "registry"; then
+    if command -v host >/dev/null 2>&1 && host lscr.io >/dev/null 2>&1; then
+      warn "lscr.io resolves in DNS but HTTPS probe failed. Continuing — docker pull may still work."
+      warn "If pull fails later, check firewall/proxy rules for lscr.io and registry traffic."
+    else
+      die "Could not reach https://lscr.io/v2/ and DNS lookup for lscr.io failed. Check DNS and firewall."
     fi
-  done
+  fi
+
+  detail "Probing Docker Hub registry (registry-1.docker.io/v2/) ..."
+  if ! url_is_reachable "https://registry-1.docker.io/v2/" "registry"; then
+    die "Could not reach https://registry-1.docker.io/v2/. Check DNS, firewall, and proxy settings."
+  fi
+
   if command -v host >/dev/null 2>&1; then
-    for ep in docker.io ui.com; do
+    for ep in docker.io lscr.io ui.com; do
       detail "DNS lookup: ${ep}"
       if ! host "${ep}" >/dev/null 2>&1; then
         warn "DNS lookup failed for ${ep}. Installation may fail if resolution stays broken."
