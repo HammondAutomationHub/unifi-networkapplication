@@ -17,6 +17,11 @@
 #       --mongo-tag TAG      docker.io/mongo tag (default: 7.0 — see compatibility note below)
 #       --network MODE       "bridge" (default) or "host"
 #       --fresh              Force a fresh install (refuses if legacy data exists at --dir)
+#       --migrate-from-deb   Automate native .deb -> Docker migration (backup, stop, restore)
+#       --backup-file PATH   Use this .unf backup (optional; auto-detected if omitted)
+#       --unifi-user USER    Native controller admin user (or env UNIFI_CTRL_USER)
+#       --unifi-pass PASS    Native controller admin password (or env UNIFI_CTRL_PASS)
+#       --disable-native-after  Disable native unifi.service after successful migration
 #   -y, --yes                Non-interactive: accept all defaults, no confirmation prompt
 #   -h, --help               Show this help text
 #
@@ -44,7 +49,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-SCRIPT_VERSION="1.2.0"
+SCRIPT_VERSION="1.4.0"
 
 # ----------------------------------------------------------------------------
 # Defaults (overridable via flags)
@@ -58,7 +63,15 @@ MONGO_TAG_CLI_SET=0
 NETWORK_MODE="bridge"
 NETWORK_MODE_CLI_SET=0
 FORCE_FRESH=0
+MIGRATE_FROM_DEB=0
 ASSUME_YES=0
+BACKUP_FILE=""
+UNIFI_CTRL_USER="${UNIFI_CTRL_USER:-}"
+UNIFI_CTRL_PASS="${UNIFI_CTRL_PASS:-}"
+DISABLE_NATIVE_AFTER=0
+MIGRATION_UNF=""
+MIGRATION_RESTORE_OK=0
+UNIFI_API="https://127.0.0.1:8443"
 
 LOG_FILE="/tmp/unifi-install-$(date +%Y%m%d-%H%M%S).log"
 
@@ -168,6 +181,11 @@ while [[ $# -gt 0 ]]; do
     --mongo-tag) MONGO_TAG="$2"; MONGO_TAG_CLI_SET=1; shift 2 ;;
     --network) NETWORK_MODE="$2"; NETWORK_MODE_CLI_SET=1; shift 2 ;;
     --fresh) FORCE_FRESH=1; shift ;;
+    --migrate-from-deb) MIGRATE_FROM_DEB=1; FORCE_FRESH=1; shift ;;
+    --backup-file) BACKUP_FILE="$2"; shift 2 ;;
+    --unifi-user) UNIFI_CTRL_USER="$2"; shift 2 ;;
+    --unifi-pass) UNIFI_CTRL_PASS="$2"; shift 2 ;;
+    --disable-native-after) DISABLE_NATIVE_AFTER=1; shift ;;
     -f|--force)
       warn "--force is deprecated and ignored. The script auto-detects upgrade vs fresh install."
       warn "Use --fresh to force a new install on an empty directory only."
@@ -633,10 +651,286 @@ detect_orphan_containers() {
   [[ "${running}" -eq 1 ]]
 }
 
+# ----------------------------------------------------------------------------
+# Native .deb -> Docker migration (automated)
+# ----------------------------------------------------------------------------
+native_autobackup_dir() {
+  local dir=""
+  if [[ -f /usr/lib/unifi/data/system.properties ]]; then
+    dir="$(grep -s '^autobackup.dir=' /usr/lib/unifi/data/system.properties | cut -d= -f2- | tr -d '\r')"
+  fi
+  if [[ -z "${dir}" ]]; then
+    dir="/usr/lib/unifi/data/backup/autobackup"
+  fi
+  printf '%s' "${dir}"
+}
+
+find_latest_unf_in_dirs() {
+  local dir unf
+  for dir in "$@"; do
+    [[ -d "${dir}" ]] || continue
+    unf="$(find "${dir}" -maxdepth 3 -type f -name '*.unf' -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)"
+    if [[ -n "${unf}" && -f "${unf}" ]]; then
+      printf '%s' "${unf}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+unifi_response_rc() {
+  local body="$1"
+  if command -v jq >/dev/null 2>&1; then
+    jq -r '.meta.rc // empty' <<< "${body}" 2>/dev/null
+    return 0
+  fi
+  grep -o '"rc"[[:space:]]*:[[:space:]]*"[^"]*"' <<< "${body}" | head -1 | sed 's/.*"\([^"]*\)"$/\1/'
+}
+
+valid_unf_file() {
+  local path="$1"
+  [[ -f "${path}" && -s "${path}" ]] || return 1
+  if head -c 64 "${path}" | grep -qiE 'DOCTYPE|<html'; then
+    return 1
+  fi
+  return 0
+}
+
+unifi_api_login() {
+  local base_url="$1" user="$2" pass="$3" cookie_jar="$4"
+  local response rc
+  response="$(curl -k -s -c "${cookie_jar}" -b "${cookie_jar}" \
+    -X POST "${base_url}/api/login" \
+    -H 'Content-Type: application/json' \
+    --data "{\"username\":\"${user}\",\"password\":\"${pass}\"}" 2>/dev/null || true)"
+  rc="$(unifi_response_rc "${response}")"
+  [[ "${rc}" == "ok" ]]
+}
+
+download_native_api_backup() {
+  local dest="$1" cookie_jar="$2"
+  local http_code tmp
+  tmp="$(mktemp)"
+  http_code="$(curl -k -s -b "${cookie_jar}" -c "${cookie_jar}" \
+    -X POST "${UNIFI_API}/api/s/default/cmd/backup" \
+    -o "${dest}" -w '%{http_code}' 2>/dev/null || echo "000")"
+  detail "Native API backup HTTP ${http_code} -> ${dest}"
+  if [[ "${http_code}" != "200" ]] || ! valid_unf_file "${dest}"; then
+    rm -f "${dest}"
+    return 1
+  fi
+  ok "Created live .unf backup from native controller API."
+  return 0
+}
+
+prepare_migration_backup() {
+  local backup_dir unf age_days cookie_jar
+  backup_dir="${INSTALL_DIR}/migration-backup"
+  mkdir -p "${backup_dir}"
+  cookie_jar="$(mktemp)"
+
+  info "=== MIGRATION: locating or creating .unf backup ==="
+
+  if [[ -n "${BACKUP_FILE}" ]]; then
+    [[ -f "${BACKUP_FILE}" ]] || abort_data_loss "Backup file not found: ${BACKUP_FILE}"
+    valid_unf_file "${BACKUP_FILE}" || abort_data_loss "File does not look like a valid .unf backup: ${BACKUP_FILE}"
+    MIGRATION_UNF="${backup_dir}/selected-$(basename "${BACKUP_FILE}")"
+    cp -a "${BACKUP_FILE}" "${MIGRATION_UNF}"
+    ok "Using backup file: ${BACKUP_FILE}"
+    rm -f "${cookie_jar}"
+    return 0
+  fi
+
+  if [[ -n "${UNIFI_CTRL_USER}" && -n "${UNIFI_CTRL_PASS}" ]]; then
+    if systemctl is-active --quiet unifi 2>/dev/null; then
+      info "Creating fresh backup from running native controller via API..."
+      MIGRATION_UNF="${backup_dir}/native-live-$(date +%Y%m%d-%H%M%S).unf"
+      if unifi_api_login "${UNIFI_API}" "${UNIFI_CTRL_USER}" "${UNIFI_CTRL_PASS}" "${cookie_jar}" \
+        && download_native_api_backup "${MIGRATION_UNF}" "${cookie_jar}"; then
+        rm -f "${cookie_jar}"
+        return 0
+      fi
+      warn "Live API backup failed (wrong credentials or API unavailable)."
+    else
+      warn "Native unifi service is not running; skipping live API backup."
+    fi
+  fi
+
+  unf="$(find_latest_unf_in_dirs "$(native_autobackup_dir)" /usr/lib/unifi/data/backup "${INSTALL_DIR}/migration-backup")" || true
+  if [[ -n "${unf}" ]] && valid_unf_file "${unf}"; then
+    age_days=$(( ( $(date +%s) - $(stat -c %Y "${unf}") ) / 86400 ))
+    MIGRATION_UNF="${backup_dir}/autobackup-$(basename "${unf}")"
+    cp -a "${unf}" "${MIGRATION_UNF}"
+    if [[ "${age_days}" -gt 1 ]]; then
+      warn "Latest autobackup is ${age_days} day(s) old: ${unf}"
+      warn "For best results, provide --unifi-user/--unifi-pass for a live backup."
+    fi
+    ok "Using native autobackup: ${unf}"
+    rm -f "${cookie_jar}"
+    return 0
+  fi
+
+  rm -f "${cookie_jar}"
+  abort_data_loss "No .unf backup found. Provide one of:
+  - --backup-file /path/to/backup.unf
+  - --unifi-user USER --unifi-pass PASS (while native unifi is running)
+  - Enable autobackup on the native controller and wait for a backup in $(native_autobackup_dir)"
+}
+
+stop_native_unifi_service() {
+  info "Stopping native UniFi service..."
+  if systemctl is-active --quiet unifi 2>/dev/null; then
+    if ! systemctl stop unifi; then
+      abort_data_loss "Failed to stop native unifi service. Run: sudo systemctl stop unifi"
+    fi
+    sleep 2
+  fi
+  if systemctl is-active --quiet unifi 2>/dev/null; then
+    abort_data_loss "Native unifi service is still active after stop request."
+  fi
+  ok "Native unifi service stopped."
+}
+
+wait_for_unifi_api() {
+  local i code
+  info "Waiting for UniFi API on ${UNIFI_API}..."
+  for i in $(seq 1 90); do
+    code="$(curl -k -s -o /dev/null -w '%{http_code}' --max-time 3 "${UNIFI_API}/status" 2>/dev/null || echo "000")"
+    if [[ "${code}" =~ ^(200|204|302)$ ]]; then
+      ok "UniFi API is responding (HTTP ${code})."
+      return 0
+    fi
+    detail "UniFi API not ready (HTTP ${code:-none}, attempt ${i}/90)..."
+    sleep 5
+  done
+  return 1
+}
+
+restore_unf_via_api() {
+  local unf="$1" response http_code rc cookie_jar
+  info "Uploading .unf backup to Docker UniFi controller..."
+  detail "Backup file: ${unf} ($(du -h "${unf}" | awk '{print $1}'))"
+
+  response="$(mktemp)"
+  http_code="$(curl -k -s -w '%{http_code}' -o "${response}" \
+    -X POST "${UNIFI_API}/api/s/default/cmd/restore" \
+    -F "file=@${unf}" 2>/dev/null || echo "000")"
+  detail "Restore upload HTTP ${http_code}"
+  rc="$(unifi_response_rc "$(cat "${response}" 2>/dev/null)")"
+  rm -f "${response}"
+
+  if [[ "${http_code}" == "200" && "${rc}" == "ok" ]]; then
+    ok "Restore accepted by controller — waiting for restart..."
+    return 0
+  fi
+
+  if [[ -n "${UNIFI_CTRL_USER}" && -n "${UNIFI_CTRL_PASS}" ]]; then
+    cookie_jar="$(mktemp)"
+    if unifi_api_login "${UNIFI_API}" "${UNIFI_CTRL_USER}" "${UNIFI_CTRL_PASS}" "${cookie_jar}"; then
+      response="$(mktemp)"
+      http_code="$(curl -k -s -b "${cookie_jar}" -c "${cookie_jar}" -w '%{http_code}' -o "${response}" \
+        -X POST "${UNIFI_API}/api/s/default/cmd/restore" \
+        -F "file=@${unf}" 2>/dev/null || echo "000")"
+      rc="$(unifi_response_rc "$(cat "${response}" 2>/dev/null)")"
+      rm -f "${response}" "${cookie_jar}"
+      if [[ "${http_code}" == "200" && "${rc}" == "ok" ]]; then
+        ok "Restore accepted (authenticated upload)."
+        return 0
+      fi
+    fi
+    rm -f "${cookie_jar}"
+  fi
+
+  warn "Automatic .unf restore via API did not succeed."
+  return 1
+}
+
+wait_after_restore() {
+  info "Waiting for controller to finish restore (may take several minutes)..."
+  sleep 15
+  wait_for_unifi_api || return 1
+  sleep 10
+  wait_for_unifi_web || true
+  return 0
+}
+
+configure_inform_host_via_api() {
+  local host_ip="$1" cookie_jar response rc
+  [[ -n "${UNIFI_CTRL_USER}" && -n "${UNIFI_CTRL_PASS}" ]] || {
+    warn "Skipping Inform Host API step (--unifi-user/--unifi-pass not set)."
+    return 1
+  }
+
+  cookie_jar="$(mktemp)"
+  info "Setting Inform Host to ${host_ip} via API..."
+  if ! unifi_api_login "${UNIFI_API}" "${UNIFI_CTRL_USER}" "${UNIFI_CTRL_PASS}" "${cookie_jar}"; then
+    warn "Could not log in to Docker controller after restore (credentials must match the backup)."
+    rm -f "${cookie_jar}"
+    return 1
+  fi
+
+  response="$(curl -k -s -b "${cookie_jar}" -c "${cookie_jar}" \
+    -X PUT "${UNIFI_API}/api/s/default/set/setting/system" \
+    -H 'Content-Type: application/json' \
+    --data "{\"inform_host\":\"${host_ip}\",\"inform_host_override\":true}" 2>/dev/null || true)"
+  rc="$(unifi_response_rc "${response}")"
+  rm -f "${cookie_jar}"
+
+  if [[ "${rc}" == "ok" ]]; then
+    ok "Inform Host set to ${host_ip} (override enabled)."
+    return 0
+  fi
+  warn "Inform Host API update failed (rc=${rc:-unknown}). Set it manually in the web UI."
+  return 1
+}
+
+run_migration_post_install() {
+  local host_ip
+  host_ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  host_ip="${host_ip:-127.0.0.1}"
+
+  wait_for_unifi_api || {
+    warn "UniFi API not ready — restore must be completed manually with: ${MIGRATION_UNF}"
+    return 1
+  }
+
+  if restore_unf_via_api "${MIGRATION_UNF}"; then
+    wait_after_restore
+    configure_inform_host_via_api "${host_ip}" || true
+    MIGRATION_RESTORE_OK=1
+    ok "Automated migration restore completed."
+  else
+    warn "Manual restore required in the web UI using: ${MIGRATION_UNF}"
+    return 1
+  fi
+
+  if [[ "${DISABLE_NATIVE_AFTER}" -eq 1 ]]; then
+    info "Disabling native unifi.service..."
+    systemctl disable unifi 2>/dev/null || true
+    ok "Native unifi.service disabled (Docker controller is now primary)."
+  fi
+}
+
 detect_installation() {
   detail "Scanning for existing UniFi installations..."
 
   if detect_native_unifi; then
+    if [[ "${MIGRATE_FROM_DEB}" -eq 1 ]]; then
+      INSTALL_MODE="fresh"
+      LEGACY_REASON="native_deb_migrate"
+      ok "Automated migration mode: native .deb -> Docker at ${INSTALL_DIR}."
+      detail "Will backup, stop native service, install Docker, and restore .unf via API."
+      return 0
+    fi
+    if [[ "${FORCE_FRESH}" -eq 1 ]]; then
+      INSTALL_MODE="fresh"
+      LEGACY_REASON="native_deb_migrate"
+      warn "Native .deb UniFi detected. --fresh installs a new Docker controller at ${INSTALL_DIR}."
+      warn "Native data is NOT migrated automatically — restore from a .unf backup after install."
+      detail "Stop native UniFi before continuing: sudo systemctl stop unifi"
+      ok "Migration mode: fresh Docker install (requires .unf restore in web wizard)."
+      return 0
+    fi
     INSTALL_MODE="blocked"
     LEGACY_REASON="native_deb"
     warn "Detected native UniFi Network Application (.deb package) on this host."
@@ -719,11 +1013,17 @@ report_blocked_legacy() {
       echo " Safe migration steps:"
       echo "   1. Open the existing controller web UI."
       echo "   2. Settings -> System -> Backup -> Download backup (.unf)."
-      echo "   3. Optionally stop the native service: sudo systemctl stop unifi"
-      echo "   4. Re-run this script on a clean directory (default ~/unifi):"
+      echo "   3. Stop the native service: sudo systemctl stop unifi"
+      echo "   4. Automated migration (recommended):"
+      echo "        UNIFI_CTRL_USER=admin UNIFI_CTRL_PASS='your-password' \\"
+      echo "          ./install-unifi-docker.sh --migrate-from-deb -y"
+      echo "   Or manual Docker install after backup:"
       echo "        ./install-unifi-docker.sh --fresh -y"
       echo "   5. In the new install wizard: Restore from backup (.unf)."
       echo "   6. Settings -> System -> Advanced -> set Inform Host and enable Override."
+      ;;
+    native_deb_migrate)
+      echo " (This message should not appear — migration mode proceeds automatically.)"
       ;;
     compose_without_env|orphan_mongo_data|orphan_config)
       echo " Legacy data was found but credentials or compose metadata are missing."
@@ -1084,6 +1384,21 @@ wait_for_mongo_healthy() {
   abort_data_loss "MongoDB did not become healthy within 3 minutes."
 }
 
+ensure_native_unifi_stopped_for_migration() {
+  [[ "${LEGACY_REASON}" == "native_deb_migrate" ]] || return 0
+
+  if [[ "${MIGRATE_FROM_DEB}" -eq 1 ]]; then
+    stop_native_unifi_service
+  elif systemctl is-active --quiet unifi 2>/dev/null; then
+    abort_data_loss "Native unifi service is still running. Use --migrate-from-deb to stop it automatically, or run: sudo systemctl stop unifi"
+  fi
+
+  if port_is_listening 8443; then
+    abort_data_loss "Port 8443 is still in use by another process. Free the port before continuing."
+  fi
+  ok "Port 8443 is available for the Docker install."
+}
+
 wait_for_unifi_web() {
   info "Waiting for UniFi web UI (https://localhost:8443)..."
   local i code
@@ -1112,6 +1427,8 @@ confirm_proceed() {
   echo "  Network mode       : ${NETWORK_MODE}"
   if [[ "${INSTALL_MODE}" == "upgrade" ]]; then
     echo "  Data handling      : backup + in-place upgrade (credentials preserved)"
+  elif [[ "${LEGACY_REASON}" == "native_deb_migrate" || "${MIGRATE_FROM_DEB}" -eq 1 ]]; then
+    echo "  Migration          : automated native .deb -> Docker (.unf restore via API)"
   fi
   echo "  UniFi memory limit : ${UNIFI_MEM_LIMIT} MB (MEM_STARTUP=${UNIFI_MEM_STARTUP} MB)"
   echo ""
@@ -1135,7 +1452,12 @@ run_fresh_install() {
     abort_data_loss "mongo-data already exists at ${INSTALL_DIR}/mongo-data. Use upgrade mode or remove data intentionally."
   fi
 
+  if [[ "${MIGRATE_FROM_DEB}" -eq 1 ]]; then
+    prepare_migration_backup
+  fi
+
   mkdir -p "${INSTALL_DIR}"
+  ensure_native_unifi_stopped_for_migration
   check_port_conflicts
   write_env_file "fresh"
   write_compose_files
@@ -1149,6 +1471,10 @@ run_fresh_install() {
   wait_for_mongo_healthy
   scan_mongo_logs_for_errors || warn "MongoDB log scan reported issues on fresh install — check: docker compose logs unifi-db"
   wait_for_unifi_web || true
+
+  if [[ "${MIGRATE_FROM_DEB}" -eq 1 ]]; then
+    run_migration_post_install || warn "Docker is installed; complete restore manually if needed."
+  fi
 
   print_summary "fresh"
 }
@@ -1257,7 +1583,30 @@ print_summary() {
     echo " Backup:        ${BACKUP_ARCHIVE}"
     echo " Baseline:      ${BASELINE_FILE}"
   fi
-  if [[ "${mode}" == "fresh" ]]; then
+  if [[ "${mode}" == "fresh" && "${MIGRATION_RESTORE_OK}" -eq 1 ]]; then
+    echo "----------------------------------------------------------------"
+    echo " Automated migration complete"
+    echo " Backup used:   ${MIGRATION_UNF}"
+    echo " Web UI:        https://${host_ip}:8443"
+    echo " Verify devices reconnect; adopt if Inform Host was set."
+    echo "----------------------------------------------------------------"
+  elif [[ "${mode}" == "fresh" && "${MIGRATE_FROM_DEB}" -eq 1 ]]; then
+    echo "----------------------------------------------------------------"
+    echo " Docker installed — finish migration manually if restore did not run:"
+    echo "   Backup file: ${MIGRATION_UNF:-<see migration-backup/ >}"
+    echo "   Web UI: https://${host_ip}:8443 -> Restore from backup"
+    echo "   Set Inform Host to ${host_ip} with Override enabled"
+    echo "----------------------------------------------------------------"
+  elif [[ "${mode}" == "fresh" && "${LEGACY_REASON}" == "native_deb_migrate" ]]; then
+    echo "----------------------------------------------------------------"
+    echo " Native (.deb) -> Docker migration — next steps:"
+    echo "   1. Open the web UI above and complete the setup wizard"
+    echo "   2. Choose Restore from backup and upload your .unf file"
+    echo "   3. Settings -> System -> Advanced -> Inform Host = ${host_ip}"
+    echo "      Enable Override Inform Host"
+    echo "   4. Optional after devices reconnect: sudo systemctl disable --now unifi"
+    echo "----------------------------------------------------------------"
+  elif [[ "${mode}" == "fresh" ]]; then
     echo "----------------------------------------------------------------"
     echo " Migrating from another controller (manual restore):"
     echo "   1. Old controller: Settings -> System -> Download backup (.unf)"
@@ -1281,9 +1630,9 @@ if [[ "${INSTALL_MODE}" == "blocked" ]]; then
   abort_data_loss "Resolve the legacy state above, then re-run this script."
 fi
 
-if [[ "${FORCE_FRESH}" -eq 1 ]]; then
+if [[ "${MIGRATE_FROM_DEB}" -eq 1 || "${FORCE_FRESH}" -eq 1 ]]; then
   if [[ "${INSTALL_MODE}" == "upgrade" ]]; then
-    abort_data_loss "--fresh was specified but an existing Docker install was detected at ${INSTALL_DIR}. Remove --fresh to upgrade safely."
+    abort_data_loss "--fresh/--migrate-from-deb was specified but an existing Docker install was detected at ${INSTALL_DIR}."
   fi
   INSTALL_MODE="fresh"
 fi

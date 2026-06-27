@@ -110,6 +110,11 @@ MongoDB credentials and image tags are stored in `~/unifi/.env` (mode `600` — 
 | `--mongo-tag TAG` | Official MongoDB image tag (default: `7.0` on fresh install; preserved on upgrade unless set) |
 | `--network MODE` | `bridge` (default) or `host` |
 | `--fresh` | Force fresh install (refuses if legacy data exists at `--dir`) |
+| `--migrate-from-deb` | Automated native `.deb` → Docker migration |
+| `--backup-file PATH` | `.unf` backup for migration (optional) |
+| `--unifi-user USER` | Native controller admin user (or `UNIFI_CTRL_USER`) |
+| `--unifi-pass PASS` | Native controller password (or `UNIFI_CTRL_PASS`) |
+| `--disable-native-after` | Disable native `unifi.service` after migration |
 | `-y`, `--yes` | Non-interactive; skip confirmation prompt |
 | `-h`, `--help` | Show built-in help |
 
@@ -177,13 +182,48 @@ The script **never regenerates MongoDB passwords** on upgrade. It **aborts** if:
 
 ## Migrating from a native (.deb) controller
 
-Automated migration from a native UniFi package is **not supported** (different data layout). Safe path:
+### Automated migration (recommended)
 
-1. On the old controller: **Settings → System → Backup** → download `.unf`
-2. Optionally stop the native service: `sudo systemctl stop unifi`
-3. Run this script on a clean directory: `./install-unifi-docker.sh --fresh -y`
-4. In the new wizard: **Restore from backup**
-5. **Settings → System → Advanced** → set **Inform Host** to this machine’s IP and enable **Override**
+The script can backup, stop native UniFi, install Docker, restore your `.unf`, and set **Inform Host** via the API:
+
+```bash
+export UNIFI_CTRL_USER="admin"
+export UNIFI_CTRL_PASS="your-controller-password"
+
+curl -fsSL -o install-unifi-docker.sh \
+  https://raw.githubusercontent.com/HammondAutomationHub/unifi-networkapplication/main/install-unifi-docker.sh
+chmod +x install-unifi-docker.sh
+
+./install-unifi-docker.sh --migrate-from-deb --disable-native-after -y
+```
+
+**Backup sources** (first match wins):
+
+1. `--backup-file /path/to/backup.unf` if provided
+2. Live API backup using `--unifi-user` / `--unifi-pass` (native service must be running)
+3. Latest `.unf` from native autobackup (`/usr/lib/unifi/data/backup/autobackup/`)
+
+Prefer credentials for a fresh backup. Autobackup files older than 24 hours trigger a warning.
+
+**What is automated:**
+
+| Step | Automated |
+|------|-----------|
+| Create/find `.unf` backup | Yes |
+| Stop native `unifi.service` | Yes |
+| Install Docker Compose stack | Yes |
+| Upload `.unf` to new controller | Yes (API) |
+| Set Inform Host + Override | Yes (requires credentials) |
+| Disable native service | Optional (`--disable-native-after`) |
+
+If API restore fails, the script leaves Docker running and prints the backup path for manual restore in the web UI.
+
+### Manual migration
+
+1. **Settings → System → Backup** → download `.unf`
+2. `sudo systemctl stop unifi`
+3. `./install-unifi-docker.sh --fresh -y`
+4. Restore in the web wizard; set **Inform Host** manually
 
 ## Day-to-day operations
 
