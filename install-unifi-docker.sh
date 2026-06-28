@@ -49,7 +49,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-SCRIPT_VERSION="1.4.4"
+SCRIPT_VERSION="1.4.5"
 
 # ----------------------------------------------------------------------------
 # Defaults (overridable via flags)
@@ -241,9 +241,21 @@ require_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "Required command '$1' not found. Install it and re-run."
 }
 
-acquire_script_lock
-
-info "Running pre-flight checks..."
+detect_snap_docker() {
+  local docker_bin docker_real
+  docker_bin="$(command -v docker 2>/dev/null || true)"
+  [[ -n "${docker_bin}" ]] || return 0
+  docker_real="$(readlink -f "${docker_bin}" 2>/dev/null || echo "${docker_bin}")"
+  if [[ "${docker_real}" == *"/snap/"* ]] || [[ "${docker_bin}" == /snap/* ]]; then
+    err "Snap-packaged Docker detected (${docker_bin})."
+    err "Snap Docker often breaks MongoDB volume mounts and healthchecks on ARM boards."
+    err "Switch to apt Docker, then re-run this script:"
+    err "  sudo snap remove docker --purge"
+    err "  sudo apt-get update && sudo apt-get install -y docker.io docker-compose-v2"
+    err "  sudo systemctl enable --now docker"
+    abort_data_loss "Install apt-based Docker (docker.io) before continuing."
+  fi
+}
 
 check_host_environment() {
   detail "Checking host environment (Docker-in-Docker / container restrictions)..."
@@ -269,6 +281,10 @@ check_host_environment() {
 
   ok "Host environment check passed."
 }
+
+acquire_script_lock
+
+info "Running pre-flight checks..."
 
 # curl -f fails on registry 401/404 even when the host is reachable — use explicit codes.
 url_http_code() {
@@ -581,22 +597,6 @@ docker_compose() {
 
 docker_compose_quiet() {
   (cd "${INSTALL_DIR}" && sudo docker compose "$@" 2>/dev/null)
-}
-
-detect_snap_docker() {
-  local docker_bin docker_real
-  docker_bin="$(command -v docker 2>/dev/null || true)"
-  [[ -n "${docker_bin}" ]] || return 0
-  docker_real="$(readlink -f "${docker_bin}" 2>/dev/null || echo "${docker_bin}")"
-  if [[ "${docker_real}" == *"/snap/"* ]] || [[ "${docker_bin}" == /snap/* ]]; then
-    err "Snap-packaged Docker detected (${docker_bin})."
-    err "Snap Docker often breaks MongoDB volume mounts and healthchecks on ARM boards."
-    err "Switch to apt Docker, then re-run this script:"
-    err "  sudo snap remove docker --purge"
-    err "  sudo apt-get update && sudo apt-get install -y docker.io docker-compose-v2"
-    err "  sudo systemctl enable --now docker"
-    abort_data_loss "Install apt-based Docker (docker.io) before continuing."
-  fi
 }
 
 show_container_logs() {
