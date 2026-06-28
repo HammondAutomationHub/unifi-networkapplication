@@ -49,7 +49,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-SCRIPT_VERSION="1.4.6"
+SCRIPT_VERSION="1.4.7"
 
 # ----------------------------------------------------------------------------
 # Defaults (overridable via flags)
@@ -1339,13 +1339,8 @@ EOF
 write_compose_files() {
   mkdir -p "${INSTALL_DIR}/config" "${INSTALL_DIR}/mongo-data"
 
-  local mongo_shell mongo_healthcheck
+  local mongo_shell
   mongo_shell="$(mongo_shell_name)"
-  if [[ "${mongo_shell}" == "mongosh" ]]; then
-    mongo_healthcheck='mongosh --quiet -u "$$MONGO_INITDB_ROOT_USERNAME" -p "$$MONGO_INITDB_ROOT_PASSWORD" --authenticationDatabase admin --eval '\''db.adminCommand("ping").ok'\'' || exit 1'
-  else
-    mongo_healthcheck='mongo --quiet -u "$$MONGO_INITDB_ROOT_USERNAME" -p "$$MONGO_INITDB_ROOT_PASSWORD" --authenticationDatabase admin --eval '\''db.adminCommand("ping").ok'\'' || exit 1'
-  fi
 
   cat > "${INSTALL_DIR}/init-mongo.sh" << EOF
 #!/bin/bash
@@ -1387,7 +1382,9 @@ services:
       - ./mongo-data:/data/db
       - ./init-mongo.sh:/docker-entrypoint-initdb.d/init-mongo.sh:ro
     healthcheck:
-      test: ["CMD-SHELL", "${mongo_healthcheck}"]
+      test:
+        - CMD-SHELL
+        - ${mongo_shell} --quiet -u \$\$MONGO_INITDB_ROOT_USERNAME -p \$\$MONGO_INITDB_ROOT_PASSWORD --authenticationDatabase admin --eval 'db.adminCommand("ping").ok' || exit 1
       interval: 15s
       timeout: 10s
       retries: 30
