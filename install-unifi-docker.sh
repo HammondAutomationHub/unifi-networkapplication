@@ -49,7 +49,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-SCRIPT_VERSION="1.4.5"
+SCRIPT_VERSION="1.4.6"
 
 # ----------------------------------------------------------------------------
 # Defaults (overridable via flags)
@@ -469,6 +469,80 @@ mongo_major_from_tag() {
   echo "${tag}" | cut -d. -f1 | tr -cd '0-9'
 }
 
+mongo_patch_from_tag() {
+  local tag="$1"
+  tag="${tag%%-*}"
+  echo "${tag}" | cut -d. -f3 | tr -cd '0-9'
+}
+
+arm64_supports_mongo5_plus() {
+  # MongoDB ≥5.0 and ≥4.4.19 require ARMv8.2-A (e.g. asimdhp). Khadas VIM4 / Cortex-A73 lacks this.
+  grep -q 'asimdhp' /proc/cpuinfo 2>/dev/null
+}
+
+mongo_tag_requires_armv82() {
+  local tag="$1" major patch
+  major="$(mongo_major_from_tag "${tag}")"
+  if [[ -z "${major}" ]]; then
+    return 1
+  fi
+  if [[ "${major}" -ge 5 ]]; then
+    return 0
+  fi
+  if [[ "${major}" -eq 4 ]]; then
+    patch="$(mongo_patch_from_tag "${tag}")"
+    [[ -n "${patch}" && "${patch}" -ge 19 ]] && return 0
+  fi
+  return 1
+}
+
+validate_mongo_arm_cpu_compat() {
+  local arch
+  arch="$(uname -m)"
+  [[ "${arch}" == "aarch64" || "${arch}" == "arm64" ]] || return 0
+  arm64_supports_mongo5_plus && return 0
+  if mongo_tag_requires_armv82 "${MONGO_TAG}"; then
+    abort_data_loss "MongoDB ${MONGO_TAG} requires ARMv8.2-A (Illegal instruction on this CPU, e.g. Khadas VIM4). Use --mongo-tag 4.4.18"
+  fi
+}
+
+apply_arm_mongo_defaults() {
+  local arch
+  arch="$(uname -m)"
+  [[ "${arch}" == "aarch64" || "${arch}" == "arm64" ]] || return 0
+
+  if arm64_supports_mongo5_plus; then
+    detail "ARM64 CPU reports ARMv8.2+ (asimdhp); default MongoDB tag is OK."
+    return 0
+  fi
+
+  warn "ARM64 CPU lacks ARMv8.2-A (no asimdhp in /proc/cpuinfo)."
+  warn "MongoDB 5.0+ and 4.4.19+ crash with 'Illegal instruction' on this board (Khadas VIM4, Pi 4, etc.)."
+
+  if [[ "${MONGO_TAG_CLI_SET}" -eq 1 ]]; then
+    validate_mongo_arm_cpu_compat
+    return 0
+  fi
+
+  MONGO_TAG="4.4.18"
+  ok "Auto-selected MongoDB ${MONGO_TAG} for this ARM64 CPU."
+}
+
+mongo_shell_name() {
+  if [[ "$(mongo_major_from_tag "${MONGO_TAG}")" -ge 5 ]]; then
+    echo "mongosh"
+  else
+    echo "mongo"
+  fi
+}
+
+mongo_compose_exec_eval() {
+  local js="$1"
+  docker_compose exec -T unifi-db "$(mongo_shell_name)" --quiet \
+    -u "${MONGO_ROOT_USER}" -p "${MONGO_ROOT_PASS}" --authenticationDatabase admin \
+    --eval "${js}" 2>/dev/null | tr -d '\r'
+}
+
 validate_mongo_tag_upgrade() {
   local installed_tag="$1"
   local target_tag="$2"
@@ -559,9 +633,11 @@ esac
 if [[ "${ARCH}" == "x86_64" ]]; then
   if ! grep -q avx /proc/cpuinfo 2>/dev/null; then
     warn "CPU does not report AVX. MongoDB >4.4 on x86_64 requires AVX."
-    warn "If mongo crash-loops, pin --mongo-tag 4.4."
+    warn "If mongo crash-loops, pin --mongo-tag 4.4.18."
   fi
 fi
+
+apply_arm_mongo_defaults
 
 require_cmd curl
 require_cmd sudo
@@ -1263,22 +1339,30 @@ EOF
 write_compose_files() {
   mkdir -p "${INSTALL_DIR}/config" "${INSTALL_DIR}/mongo-data"
 
-  cat > "${INSTALL_DIR}/init-mongo.sh" << 'EOF'
+  local mongo_shell mongo_healthcheck
+  mongo_shell="$(mongo_shell_name)"
+  if [[ "${mongo_shell}" == "mongosh" ]]; then
+    mongo_healthcheck='mongosh --quiet -u "$$MONGO_INITDB_ROOT_USERNAME" -p "$$MONGO_INITDB_ROOT_PASSWORD" --authenticationDatabase admin --eval '\''db.adminCommand("ping").ok'\'' || exit 1'
+  else
+    mongo_healthcheck='mongo --quiet -u "$$MONGO_INITDB_ROOT_USERNAME" -p "$$MONGO_INITDB_ROOT_PASSWORD" --authenticationDatabase admin --eval '\''db.adminCommand("ping").ok'\'' || exit 1'
+  fi
+
+  cat > "${INSTALL_DIR}/init-mongo.sh" << EOF
 #!/bin/bash
 set -e
-mongosh <<MONGOSCRIPT
+${mongo_shell} <<MONGOSCRIPT
 db = db.getSiblingDB('admin')
-db.auth('${MONGO_INITDB_ROOT_USERNAME}', '${MONGO_INITDB_ROOT_PASSWORD}')
-db = db.getSiblingDB('${MONGO_DBNAME}')
+db.auth('\${MONGO_INITDB_ROOT_USERNAME}', '\${MONGO_INITDB_ROOT_PASSWORD}')
+db = db.getSiblingDB('\${MONGO_DBNAME}')
 db.createUser({
-  user: '${MONGO_USER}',
-  pwd: '${MONGO_PASS}',
-  roles: [ { role: 'dbOwner', db: '${MONGO_DBNAME}' } ]
+  user: '\${MONGO_USER}',
+  pwd: '\${MONGO_PASS}',
+  roles: [ { role: 'dbOwner', db: '\${MONGO_DBNAME}' } ]
 })
 MONGOSCRIPT
 EOF
   chmod +x "${INSTALL_DIR}/init-mongo.sh"
-  detail "init-mongo.sh written (runs only when mongo-data is empty)."
+  detail "init-mongo.sh written (shell=${mongo_shell}, runs only when mongo-data is empty)."
 
   local ports_block="" network_block_unifi=""
   if [[ "${NETWORK_MODE}" == "host" ]]; then
@@ -1303,7 +1387,7 @@ services:
       - ./mongo-data:/data/db
       - ./init-mongo.sh:/docker-entrypoint-initdb.d/init-mongo.sh:ro
     healthcheck:
-      test: ["CMD-SHELL", "mongosh \"mongodb://$$MONGO_INITDB_ROOT_USERNAME:$$MONGO_INITDB_ROOT_PASSWORD@127.0.0.1:27017/admin?authSource=admin\" --eval 'db.adminCommand(\"ping\").ok' --quiet || exit 1"]
+      test: ["CMD-SHELL", "${mongo_healthcheck}"]
       interval: 15s
       timeout: 10s
       retries: 30
@@ -1406,9 +1490,7 @@ capture_mongo_baseline() {
   total=0
   for coll in $(mongo_collections_to_check); do
     local count
-    count="$(docker_compose exec -T unifi-db mongosh --quiet \
-      -u "${MONGO_ROOT_USER}" -p "${MONGO_ROOT_PASS}" --authenticationDatabase admin \
-      --eval "db.getSiblingDB('${MONGO_DBNAME}').getCollection('${coll}').countDocuments()" 2>/dev/null | tr -d '\r' || echo "ERR")"
+    count="$(mongo_compose_exec_eval "db.getSiblingDB('${MONGO_DBNAME}').getCollection('${coll}').countDocuments()" 2>/dev/null || echo "ERR")"
     if [[ "${count}" == "ERR" || ! "${count}" =~ ^[0-9]+$ ]]; then
       count="0"
       detail "Collection '${coll}': unavailable or empty (treated as 0)."
@@ -1443,9 +1525,7 @@ verify_mongo_baseline() {
   local coll baseline_count current_count
   for coll in $(mongo_collections_to_check); do
     baseline_count="$(grep -E "^${coll}=" "${BASELINE_FILE}" | cut -d= -f2 || echo "0")"
-    current_count="$(docker_compose exec -T unifi-db mongosh --quiet \
-      -u "${MONGO_ROOT_USER}" -p "${MONGO_ROOT_PASS}" --authenticationDatabase admin \
-      --eval "db.getSiblingDB('${MONGO_DBNAME}').getCollection('${coll}').countDocuments()" 2>/dev/null | tr -d '\r' || echo "ERR")"
+    current_count="$(mongo_compose_exec_eval "db.getSiblingDB('${MONGO_DBNAME}').getCollection('${coll}').countDocuments()" 2>/dev/null || echo "ERR")"
 
     if [[ ! "${current_count}" =~ ^[0-9]+$ ]]; then
       err "Could not read collection '${coll}' after upgrade."
@@ -1499,9 +1579,7 @@ wait_for_mongo_healthy() {
       return 0
     fi
     if docker_compose_quiet ps --status running --services | grep -qx 'unifi-db'; then
-      if docker_compose exec -T unifi-db mongosh --quiet \
-        -u "${MONGO_ROOT_USER}" -p "${MONGO_ROOT_PASS}" --authenticationDatabase admin \
-        --eval 'db.adminCommand("ping").ok' 2>/dev/null | grep -q '1'; then
+      if mongo_compose_exec_eval 'db.adminCommand("ping").ok' 2>/dev/null | grep -q '1'; then
         ok "MongoDB responded to authenticated ping."
         return 0
       fi
@@ -1588,6 +1666,7 @@ run_fresh_install() {
   ensure_native_unifi_stopped_for_migration
   check_port_conflicts
   write_env_file "fresh"
+  validate_mongo_arm_cpu_compat
   write_compose_files
 
   info "Pulling container images..."
@@ -1629,7 +1708,9 @@ run_upgrade() {
     validate_mongo_tag_upgrade "${old_mongo_tag}" "${MONGO_TAG}"
   else
     detail "Mongo tag will remain: ${old_mongo_tag}"
+    MONGO_TAG="${old_mongo_tag}"
   fi
+  validate_mongo_arm_cpu_compat
 
   info "Pausing UniFi app container for a consistent MongoDB baseline snapshot..."
   docker_compose stop -t 60 unifi 2>/dev/null || true

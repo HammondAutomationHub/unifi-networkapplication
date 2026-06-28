@@ -22,7 +22,7 @@ Designed for **Ubuntu/Debian** hosts on **x86_64** and **arm64** (including boar
 | RAM | 1 GB (script aborts below) | 4 GB+ |
 | Disk | 5 GB free on install volume | 10 GB+ (more for large sites / backups) |
 | OS | Ubuntu or Debian (apt-based) | Ubuntu 22.04+ / Debian 12+ |
-| CPU | x86_64 with AVX (MongoDB >4.4) or arm64 | — |
+| CPU | x86_64 with AVX (MongoDB >4.4) or arm64 with ARMv8.2-A for MongoDB 5+ | On arm64 without ARMv8.2-A (e.g. Khadas VIM 4), the script auto-selects MongoDB **4.4.18** |
 
 **Must run on the host OS**, not inside a Docker container. Docker (or permission to install it via `sudo`) is required.
 
@@ -107,7 +107,7 @@ MongoDB credentials and image tags are stored in `~/unifi/.env` (mode `600` — 
 | `-d`, `--dir PATH` | Install directory (default: `$HOME/unifi`) |
 | `-t`, `--tz TIMEZONE` | Timezone (default: auto-detected, fallback `UTC`) |
 | `--unifi-tag TAG` | linuxserver UniFi image tag (default: `latest` on upgrade) |
-| `--mongo-tag TAG` | Official MongoDB image tag (default: `7.0` on fresh install; preserved on upgrade unless set) |
+| `--mongo-tag TAG` | Official MongoDB image tag (default: `7.0` on capable hosts; **4.4.18** auto-selected on arm64 without ARMv8.2-A; preserved on upgrade unless set) |
 | `--network MODE` | `bridge` (default) or `host` |
 | `--fresh` | Force fresh install (refuses if legacy data exists at `--dir`) |
 | `--migrate-from-deb` | Automated native `.deb` → Docker migration |
@@ -311,7 +311,21 @@ Stop the conflicting service or choose a different host. Native UniFi (`.deb`) m
 **MongoDB crash-loop on old x86_64 CPU (no AVX)**
 
 ```bash
-./install-unifi-docker.sh --mongo-tag 4.4 -y
+./install-unifi-docker.sh --mongo-tag 4.4.18 -y
+```
+
+**MongoDB `Illegal instruction` on ARM64 (Khadas VIM 4, Raspberry Pi 4, etc.)**
+
+MongoDB 5.0+ and 4.4.19+ require **ARMv8.2-A**. The script (v1.4.6+) detects this and defaults to **4.4.18** automatically. If a previous run wrote Mongo 7.0 data or `.env`, wipe the failed data and re-run:
+
+```bash
+cd /root/unifi   # or your --dir path
+sudo docker compose down
+sudo rm -rf mongo-data/*
+curl -fsSL -o install-unifi-docker.sh \
+  https://raw.githubusercontent.com/HammondAutomationHub/unifi-networkapplication/main/install-unifi-docker.sh
+chmod +x install-unifi-docker.sh
+sudo ./install-unifi-docker.sh --migrate-from-deb -y
 ```
 
 **Low memory on ARM boards (e.g. Khadas VIM 4)**
