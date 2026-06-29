@@ -49,7 +49,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-SCRIPT_VERSION="1.4.7"
+SCRIPT_VERSION="1.4.8"
 
 # ----------------------------------------------------------------------------
 # Defaults (overridable via flags)
@@ -706,6 +706,8 @@ start_compose_stack() {
     abort_data_loss "MongoDB did not become ready."
   fi
 
+  ensure_mongo_app_user
+
   info "Starting UniFi container (unifi)..."
   if ! docker_compose up -d unifi; then
     show_container_logs "unifi" 80
@@ -1342,22 +1344,32 @@ write_compose_files() {
   local mongo_shell
   mongo_shell="$(mongo_shell_name)"
 
-  cat > "${INSTALL_DIR}/init-mongo.sh" << EOF
+  cat > "${INSTALL_DIR}/init-mongo.sh" << 'INITEOF'
 #!/bin/bash
 set -e
-${mongo_shell} <<MONGOSCRIPT
-db = db.getSiblingDB('admin')
-db.auth('\${MONGO_INITDB_ROOT_USERNAME}', '\${MONGO_INITDB_ROOT_PASSWORD}')
-db = db.getSiblingDB('\${MONGO_DBNAME}')
+if which mongosh > /dev/null 2>&1; then
+  mongo_init_bin='mongosh'
+else
+  mongo_init_bin='mongo'
+fi
+"${mongo_init_bin}" <<MONGOSCRIPT
+use ${MONGO_AUTHSOURCE}
+db.auth("${MONGO_INITDB_ROOT_USERNAME}", "${MONGO_INITDB_ROOT_PASSWORD}")
 db.createUser({
-  user: '\${MONGO_USER}',
-  pwd: '\${MONGO_PASS}',
-  roles: [ { role: 'dbOwner', db: '\${MONGO_DBNAME}' } ]
+  user: "${MONGO_USER}",
+  pwd: "${MONGO_PASS}",
+  roles: [
+    "clusterMonitor",
+    { db: "${MONGO_DBNAME}", role: "dbOwner" },
+    { db: "${MONGO_DBNAME}_stat", role: "dbOwner" },
+    { db: "${MONGO_DBNAME}_audit", role: "dbOwner" },
+    { db: "${MONGO_DBNAME}_restore", role: "dbOwner" }
+  ]
 })
 MONGOSCRIPT
-EOF
+INITEOF
   chmod +x "${INSTALL_DIR}/init-mongo.sh"
-  detail "init-mongo.sh written (shell=${mongo_shell}, runs only when mongo-data is empty)."
+  detail "init-mongo.sh written (linuxserver.io pattern, runs only when mongo-data is empty)."
 
   local ports_block="" network_block_unifi=""
   if [[ "${NETWORK_MODE}" == "host" ]]; then
@@ -1585,6 +1597,60 @@ wait_for_mongo_healthy() {
     sleep 5
   done
   return 1
+}
+
+ensure_mongo_app_user() {
+  local shell result
+
+  if docker_compose exec -T unifi-db "$(mongo_shell_name)" --quiet \
+    -u "${MONGO_APP_USER}" -p "${MONGO_APP_PASS}" \
+    --authenticationDatabase "${MONGO_AUTHSOURCE}" \
+    --eval "db.adminCommand('ping').ok" 2>/dev/null | grep -q '1'; then
+    ok "MongoDB app user ${MONGO_APP_USER}@${MONGO_AUTHSOURCE} is ready."
+    return 0
+  fi
+
+  warn "MongoDB app user ${MONGO_APP_USER}@${MONGO_AUTHSOURCE} not found."
+  warn "init-mongo.sh only runs on empty mongo-data; creating user now via root."
+
+  result="$(docker_compose exec -T unifi-db bash -s <<EOS
+set -e
+if which mongosh >/dev/null 2>&1; then M=mongosh; else M=mongo; fi
+"\$M" -u '${MONGO_ROOT_USER}' -p '${MONGO_ROOT_PASS}' --authenticationDatabase admin <<MJS
+use ${MONGO_AUTHSOURCE}
+var u = '${MONGO_APP_USER}';
+var roles = [
+  'clusterMonitor',
+  { db: '${MONGO_DBNAME}', role: 'dbOwner' },
+  { db: '${MONGO_DBNAME}_stat', role: 'dbOwner' },
+  { db: '${MONGO_DBNAME}_audit', role: 'dbOwner' },
+  { db: '${MONGO_DBNAME}_restore', role: 'dbOwner' }
+];
+try {
+  db.updateUser(u, { pwd: '${MONGO_APP_PASS}', roles: roles });
+  print('updated');
+} catch (e) {
+  db.createUser({ user: u, pwd: '${MONGO_APP_PASS}', roles: roles });
+  print('created');
+}
+MJS
+EOS
+)" || true
+
+  if ! echo "${result}" | grep -qE 'created|updated'; then
+    err "MongoDB user creation output: ${result:-<empty>}"
+    abort_data_loss "Failed to create MongoDB app user ${MONGO_APP_USER}@${MONGO_AUTHSOURCE}."
+  fi
+
+  if docker_compose exec -T unifi-db "$(mongo_shell_name)" --quiet \
+    -u "${MONGO_APP_USER}" -p "${MONGO_APP_PASS}" \
+    --authenticationDatabase "${MONGO_AUTHSOURCE}" \
+    --eval "db.adminCommand('ping').ok" 2>/dev/null | grep -q '1'; then
+    ok "MongoDB app user ${MONGO_APP_USER}@${MONGO_AUTHSOURCE} created."
+    return 0
+  fi
+
+  abort_data_loss "MongoDB app user still cannot authenticate after creation attempt."
 }
 
 ensure_native_unifi_stopped_for_migration() {
