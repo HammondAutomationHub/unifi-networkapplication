@@ -28,7 +28,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-SCRIPT_VERSION="1.0.0"
+SCRIPT_VERSION="1.0.1"
 FIRMWARE_API="https://fw-update.ubnt.com/api/firmware-latest"
 
 MIGRATE_FROM_DEB=0
@@ -221,8 +221,13 @@ download_installer() {
     return 0
   fi
 
-  [[ -n "${INSTALLER_URL}" ]] || fetch_latest_installer_url "$(uos_platform_for_arch)"
   INSTALLER_FILE="${DOWNLOAD_DIR}/unifi-os-server-installer"
+  if [[ -f "${INSTALLER_FILE}" ]] && file "${INSTALLER_FILE}" 2>/dev/null | grep -q 'ELF'; then
+    ok "Reusing existing installer: ${INSTALLER_FILE} ($(du -h "${INSTALLER_FILE}" | awk '{print $1}'))"
+    return 0
+  fi
+
+  [[ -n "${INSTALLER_URL}" ]] || fetch_latest_installer_url "$(uos_platform_for_arch)"
   info "Downloading UniFi OS Server installer (~800 MB+, this may take a while)..."
   curl -fL --progress-bar -o "${INSTALLER_FILE}" "${INSTALLER_URL}"
   ok "Download complete: $(du -h "${INSTALLER_FILE}" | awk '{print $1}')"
@@ -235,10 +240,11 @@ run_official_installer() {
   info "Running official UniFi OS Server installer..."
   detail "This configures systemd units (uosserver, uosserver-updater) and a Podman container."
 
+  # Ubiquiti 5.x+ installers: run the binary directly (no 'install' subcommand).
   if [[ "${ASSUME_YES}" -eq 1 ]]; then
-    printf 'y\n' | sudo "${INSTALLER_FILE}" install
+    printf 'y\n' | sudo "${INSTALLER_FILE}"
   else
-    sudo "${INSTALLER_FILE}" install
+    sudo "${INSTALLER_FILE}"
   fi
 }
 
