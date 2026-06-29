@@ -2,9 +2,11 @@
 #
 # install-unifi-docker.sh
 #
-# Production installer / upgrader for UniFi Network Application + MongoDB via Docker Compose.
-# Auto-detects an existing Docker install and upgrades in place (preserving data), or performs
-# a clean fresh install when no legacy application is found.
+# Production installer / upgrader for the LEGACY UniFi Network Application
+# (linuxserver.io + external MongoDB via Docker Compose).
+#
+# For the current Ubiquiti UniFi OS Server (Podman, port 11443), use:
+#   install-unifi-os-server.sh
 # Targets Ubuntu/Debian-based systems (x86_64 and arm64 — tested on Khadas VIM4).
 #
 # Usage:

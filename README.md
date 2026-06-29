@@ -1,8 +1,59 @@
-# UniFi Network Application — Docker Installer
+# UniFi self-hosting installers
+
+This repo contains **two different UniFi self-hosting paths**. They are not interchangeable.
+
+| | **UniFi OS Server** (recommended by Ubiquiti) | **Legacy Network Application** (linuxserver.io) |
+|---|------------------------------------------------|--------------------------------------------------|
+| Script | `install-unifi-os-server.sh` | `install-unifi-docker.sh` |
+| Runtime | Official Ubiquiti installer + **Podman** | Docker Compose + external MongoDB |
+| Web UI | `https://<host>:11443` | `https://<host>:8443` |
+| Features | Full UniFi OS (Organizations, Site Manager, IdP, …) | Network controller only |
+| MongoDB | Bundled inside UOS (no separate container) | Separate `mongo` container (ARMv8.2 issues on Khadas) |
+| Ubiquiti support | [Official self-hosting path](https://help.ui.com/hc/en-us/articles/34210126298775-Self-Hosting-UniFi) | Community / legacy |
+
+**If you want the updated UniFi OS Server**, use `install-unifi-os-server.sh` — **not** `install-unifi-docker.sh`.
+
+---
+
+## UniFi OS Server (official)
+
+Production Bash installer for Ubiquiti's **UniFi OS Server** on Ubuntu/Debian (x86_64 and arm64, including Khadas VIM 4).
+
+```bash
+chmod +x install-unifi-os-server.sh
+
+# Fresh install
+sudo ./install-unifi-os-server.sh -y
+
+# Migrate from native .deb and stop legacy Docker stack if present
+sudo ./install-unifi-os-server.sh --migrate-from-deb --remove-legacy-docker -y
+```
+
+Open after install: `https://<your-host-ip>:11443`
+
+Restore a `.unf` backup via **Settings → System → Restore** in the UOS wizard.
+
+### Migrate from legacy Docker (linuxserver) on Khadas
+
+If you already ran `install-unifi-docker.sh`:
+
+```bash
+cd /root/unifi
+sudo docker compose down
+sudo ~/install-unifi-os-server.sh --migrate-from-deb --remove-legacy-docker -y
+```
+
+Then restore your `.unf` at `https://<host>:11443`.
+
+---
+
+## Legacy UniFi Network Application (linuxserver.io)
 
 Production-ready Bash installer and upgrader for the [linuxserver.io UniFi Network Application](https://docs.linuxserver.io/images/docker-unifi-network-application) Docker image with MongoDB, using Docker Compose.
 
 Designed for **Ubuntu/Debian** hosts on **x86_64** and **arm64** (including boards like the Khadas VIM 4). The script auto-detects an existing install and upgrades in place while preserving data, or performs a clean fresh install when no legacy application is present.
+
+> **Note:** This is the **legacy** Network Application stack. Use it only if you explicitly want linuxserver + external MongoDB instead of UniFi OS Server.
 
 ## Features
 
@@ -345,7 +396,8 @@ ls -lt "$(dirname ~/unifi)/unifi-backups/"
 
 ```text
 unifi-networkapplication/
-├── install-unifi-docker.sh   # Installer / upgrader script
+├── install-unifi-os-server.sh   # Official UniFi OS Server (Podman) — recommended
+├── install-unifi-docker.sh      # Legacy linuxserver Network Application + MongoDB
 └── README.md
 ```
 
