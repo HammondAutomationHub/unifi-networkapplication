@@ -31,6 +31,8 @@ sudo ./install-unifi-os-server.sh --migrate-from-deb --remove-legacy-docker -y
 
 Open after install: `https://<your-host-ip>:11443`
 
+**Storage:** UniFi OS Server’s official installer requires **≥15 GB free on `/home`** (Ubiquiti recommends **25–40 GB** total). Khadas VIM4 eMMC often does not meet this — free space or add NVMe/USB before installing.
+
 Restore a `.unf` backup via **Settings → System → Restore** in the UOS wizard.
 
 ### Migrate from legacy Docker (linuxserver) on Khadas

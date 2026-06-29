@@ -28,7 +28,12 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-SCRIPT_VERSION="1.0.1"
+SCRIPT_VERSION="1.0.2"
+
+# Ubiquiti installer disk checks (GiB) — mirrors official preflight
+UOS_MIN_HOME_GB=15
+UOS_MIN_TMP_GB=2
+UOS_MIN_VARTMP_GB=2
 FIRMWARE_API="https://fw-update.ubnt.com/api/firmware-latest"
 
 MIGRATE_FROM_DEB=0
@@ -178,6 +183,64 @@ stop_legacy_docker_stack() {
   fi
 }
 
+gb_free_on_path() {
+  local path="$1"
+  df -BG "${path}" 2>/dev/null | awk 'NR==2 { gsub(/G/,"",$4); print $4 }'
+}
+
+check_disk_space() {
+  local home_gb tmp_gb vartmp_gb
+  home_gb="$(gb_free_on_path /home)"
+  tmp_gb="$(gb_free_on_path /tmp)"
+  vartmp_gb="$(gb_free_on_path /var/tmp)"
+
+  info "Checking disk space (UniFi OS Server installer requirements)..."
+  detail "/home free: ${home_gb:-?} GB (requires ${UOS_MIN_HOME_GB} GB)"
+  detail "/tmp free: ${tmp_gb:-?} GB (requires ${UOS_MIN_TMP_GB} GB)"
+  detail "/var/tmp free: ${vartmp_gb:-?} GB (requires ${UOS_MIN_VARTMP_GB} GB)"
+
+  if [[ -n "${home_gb}" && "${home_gb}" -lt "${UOS_MIN_HOME_GB}" ]]; then
+    err "/home has ${home_gb} GB free; UniFi OS Server requires ${UOS_MIN_HOME_GB} GB."
+    suggest_disk_cleanup
+    die "Insufficient disk space. Free at least $((UOS_MIN_HOME_GB - home_gb)) GB on /home before retrying."
+  fi
+  if [[ -n "${tmp_gb}" && "${tmp_gb}" -lt "${UOS_MIN_TMP_GB}" ]]; then
+    die "/tmp has ${tmp_gb} GB free; installer requires ${UOS_MIN_TMP_GB} GB."
+  fi
+  if [[ -n "${vartmp_gb}" && "${vartmp_gb}" -lt "${UOS_MIN_VARTMP_GB}" ]]; then
+    die "/var/tmp has ${vartmp_gb} GB free; installer requires ${UOS_MIN_VARTMP_GB} GB."
+  fi
+  ok "Disk space preflight passed."
+}
+
+suggest_disk_cleanup() {
+  echo ""
+  warn "Reclaim space on this host (run what applies):"
+  echo ""
+  echo "  # Docker images/containers (legacy linuxserver stack — often several GB)"
+  echo "  sudo docker system df"
+  echo "  sudo docker system prune -a -f"
+  echo ""
+  echo "  # Apt cache and old packages"
+  echo "  sudo apt-get clean"
+  echo "  sudo apt-get autoremove -y"
+  echo ""
+  echo "  # Journal logs (keep last 3 days)"
+  echo "  sudo journalctl --vacuum-time=3d"
+  echo ""
+  echo "  # UOS installer download (re-download later, or keep on USB/NVMe)"
+  echo "  rm -f ${DOWNLOAD_DIR}/unifi-os-server-installer   # ~834 MB"
+  echo ""
+  echo "  # Legacy Docker data directory (if migration backup .unf is saved elsewhere)"
+  echo "  sudo rm -rf /root/unifi"
+  echo ""
+  warn "Khadas eMMC is often too small for UniFi OS Server (Ubiquiti recommends 25–40 GB free)."
+  warn "If cleanup is not enough, add NVMe/USB storage or use a larger root filesystem."
+  echo ""
+  echo "  df -h /home /tmp /var/tmp"
+  echo ""
+}
+
 check_ports() {
   local port
   info "Checking required ports for UniFi OS Server..."
@@ -319,6 +382,7 @@ if [[ "${MIGRATE_FROM_DEB}" -eq 1 ]]; then
 fi
 
 stop_legacy_docker_stack
+check_disk_space
 check_ports
 ensure_podman
 download_installer
